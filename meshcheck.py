@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-purrgrid - a cat-placement logic puzzle for the terminal.
+meowdokuterm - a cat-placement logic puzzle for the terminal.
+
+The file and command are called `meshcheck` so it looks like an ordinary
+mesh-validation tool in `ps`/`top` on a shared cluster.
 
 Rules: place exactly one cat in every row, every column and every coloured
 region. Cats are territorial: no two cats may touch, not even diagonally.
 Every generated puzzle has exactly one solution. A wrong cat costs a life.
 
 Pure Python 3.6+ standard library (curses). No installs needed.
-Run `purrgrid.py --help` for options, press `?` in game for keys.
+Run `meshcheck --help` for options, press `?` in game for keys.
 """
 
 import argparse
@@ -28,6 +31,11 @@ VERSION = "1.0"
 DIFFICULTIES = ("easy", "medium", "hard")
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 MIN_N, MAX_N = 4, 14
+
+# Levels: a fixed, numbered set of puzzles for each board size and difficulty.
+LEVEL_COUNT = 20
+LEVEL_SIZES = tuple(range(5, 13))
+LEVEL_SEED_BASE = 10 ** 6  # random quick-play seeds stay below this
 
 EMPTY, MARK, CAT = 0, 1, 2
 
@@ -328,6 +336,15 @@ def generate(n, difficulty="medium", seed=None, max_tries=600, budget=None):
     return Puzzle(n, reg, sol, seed, d)
 
 
+def level_puzzle(n, difficulty, level):
+    """Level `level` (1-based) of a pack. No time budget, so every machine
+    generates exactly the same board."""
+    p = generate(n, difficulty, LEVEL_SEED_BASE + level, max_tries=300, budget=float("inf"))
+    p.label = "level %d" % level
+    p.level = (n, difficulty, level)
+    return p
+
+
 def daily_puzzle(day=None):
     day = day or datetime.date.today()
     seed = int(day.strftime("%Y%m%d"))
@@ -341,7 +358,7 @@ def daily_puzzle(day=None):
 # ---------------------------------------------------------------------------
 
 def puzzle_to_text(p, with_solution=False):
-    lines = ["# purrgrid size=%d difficulty=%s seed=%s" % (p.n, p.difficulty, p.seed)]
+    lines = ["# meshcheck size=%d difficulty=%s seed=%s" % (p.n, p.difficulty, p.seed)]
     for r in range(p.n):
         lines.append("".join(LETTERS[p.regions[r][c]] for c in range(p.n)))
     if with_solution:
@@ -398,17 +415,50 @@ def parse_puzzles(text):
 # Stats
 # ---------------------------------------------------------------------------
 
-def stats_path():
+def stats_path(name="meshcheck"):
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, "purrgrid", "stats.json")
+    return os.path.join(base, name, "stats.json")
 
 
 def load_stats():
-    try:
-        with open(stats_path()) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    # fall back to stats saved under the project's old name (purrgrid)
+    for path in (stats_path(), stats_path("purrgrid")):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def level_key(n, difficulty):
+    return "%dx%d-%s" % (n, n, difficulty)
+
+
+def level_progress(stats, n, difficulty):
+    """{level number: best time or None (solved with hints)} for one level pack."""
+    pack = stats.get("levels", {}).get(level_key(n, difficulty), {})
+    return dict((int(k), v.get("best")) for k, v in pack.items())
+
+
+def stats_lines(st):
+    lines = []
+    for k in sorted(st):
+        if k == "daily":
+            lines.append("daily puzzles solved: %d" % len(st[k]))
+        elif k == "levels":
+            for pack in sorted(st[k], key=lambda s: (int(s.split("x")[0]), s)):
+                lines.append("levels %-14s %2d/%d solved" % (pack, len(st[k][pack]), LEVEL_COUNT))
+        else:
+            best = st[k]["best"]
+            lines.append("%-14s solved %4d   best %s" % (k, st[k]["solved"],
+                                                       fmt_time(best) if best is not None else "-"))
+    return lines
+
+
+def fmt_time(t):
+    t = int(t)
+    return "%d:%02d:%02d" % (t // 3600, t // 60 % 60, t % 60) if t >= 3600 else "%02d:%02d" % (t // 60, t % 60)
 
 
 def save_stats(st):
@@ -538,32 +588,22 @@ class Game(object):
 # Puzzle source
 # ---------------------------------------------------------------------------
 
-class Source(object):
-    def __init__(self, args):
-        self.args = args
-        self.file_puzzles = None
-        self.idx = -1
-        self.first = True
-        if args.load:
-            with open(args.load) as f:
-                self.file_puzzles = parse_puzzles(f.read())
-            if not self.file_puzzles:
-                raise SystemExit("no puzzles found in " + args.load)
-            self.idx = (args.index - 1) - 1 if args.index else -1
+class FileSource(object):
+    """Puzzles loaded with --load, played in order (wrapping around)."""
+
+    def __init__(self, path, index=None):
+        self.path = path
+        with open(path) as f:
+            self.puzzles = parse_puzzles(f.read())
+        if not self.puzzles:
+            raise SystemExit("no puzzles found in " + path)
+        self.idx = (index - 1) - 1 if index else -1
 
     def next(self):
-        a = self.args
-        if self.file_puzzles:
-            self.idx = (self.idx + 1) % len(self.file_puzzles)
-            p = self.file_puzzles[self.idx]
-            p.label = "%s #%d/%d" % (os.path.basename(a.load), self.idx + 1, len(self.file_puzzles))
-            return p
-        if self.first and a.daily:
-            self.first = False
-            return daily_puzzle()
-        seed = a.seed if (self.first and a.seed is not None) else None
-        self.first = False
-        return generate(a.size, a.difficulty, seed)
+        self.idx = (self.idx + 1) % len(self.puzzles)
+        p = self.puzzles[self.idx]
+        p.label = "%s #%d/%d" % (os.path.basename(self.path), self.idx + 1, len(self.puzzles))
+        return p
 
 
 # ---------------------------------------------------------------------------
@@ -589,8 +629,16 @@ HELP_KEYS = [
     ("B  L", "region borders  /  region letters"),
     ("Tab", "stealth mode (IPython look-alike)"),
     ("b", "boss key (press b again to return)"),
-    ("n  r  q", "new puzzle  /  restart  /  quit"),
+    ("n  r", "next puzzle  /  restart"),
+    ("m  Esc", "back to the menu"),
+    ("q", "quit"),
 ]
+
+MENU_ITEMS = ("play", "levels", "daily", "size", "difficulty", "lives", "stats", "help", "quit")
+MENU_SETTINGS = ("size", "difficulty", "lives")
+QUICK_DIFFICULTIES = DIFFICULTIES + ("any",)
+LIVES_CHOICES = (1, 2, 3, 5, 0)  # 0 = unlimited
+LEVEL_COLS = 5
 
 HELP = (["How to play"] + ["  " + s for s in RULES] + ["", "Keys"] +
         ["  %-14s %s" % kv for kv in HELP_KEYS] + ["", "Press any key to return."])
@@ -707,10 +755,20 @@ class FakeLog(object):
 
 
 class App(object):
-    def __init__(self, scr, args, source):
+    def __init__(self, scr, args, file_source=None):
         self.scr = scr
         self.args = args
-        self.source = source
+        self.file_source = file_source
+        self.size = args.size
+        self.difficulty = args.difficulty
+        self.lives = args.lives
+        self.screen = "menu"  # menu / levels / stats / game
+        self.mode = None      # what "next puzzle" means: quick / daily / file / level
+        self.game = None
+        self.menu_sel = 0
+        self.lv_focus = 2     # 0 size row, 1 difficulty row, 2 the level grid
+        self.lv_sel = 0
+        self.hits = []        # clickable menu areas: (y, x, width, callback)
         self.stealth = args.stealth
         self.automark = not args.no_automark
         self.letters = args.letters
@@ -729,7 +787,15 @@ class App(object):
         style = args.cat if self.uni else "ascii"
         self.gl = GLYPHS[style]
         self.setup_curses()
-        self.new_game(first=True)
+        self.say("", "")
+        if file_source:
+            self.start("file")
+        elif args.daily:
+            self.start("daily")
+        elif args.level:
+            self.start("level", level=args.level)
+        elif args.seed is not None or args.play:
+            self.start("quick", seed=args.seed)
 
     # -- setup ------------------------------------------------------------
     def setup_curses(self):
@@ -819,12 +885,58 @@ class App(object):
         return self.cp(P_DIM) if self.rich else curses.A_DIM
 
     # -- game lifecycle ---------------------------------------------------
-    def new_game(self, first=False, puzzle=None):
-        if puzzle is None:
-            self.status_only("Generating a %dx%d %s puzzle..." % (self.args.size, self.args.size,
-                                                                 self.args.difficulty), "Running cells...")
-            puzzle = self.source.next()
-        self.game = Game(puzzle, self.args.lives)
+    def level_size(self):
+        """The current size, clamped to the sizes that have levels."""
+        return min(max(self.size, LEVEL_SIZES[0]), LEVEL_SIZES[-1])
+
+    def level_difficulty(self):
+        return self.difficulty if self.difficulty in DIFFICULTIES else "medium"
+
+    def first_unsolved(self, n, d):
+        done = level_progress(self.stats, n, d)
+        for i in range(1, LEVEL_COUNT + 1):
+            if i not in done:
+                return i
+        return 1
+
+    def start(self, mode, seed=None, level=None):
+        """Start a puzzle. mode: quick / daily / file / level."""
+        self.mode = mode
+        if mode == "file":
+            puzzle = self.file_source.next()
+        elif mode == "daily":
+            self.status_only("Fetching today's puzzle...", "Running cells...")
+            puzzle = daily_puzzle()
+        elif mode == "level":
+            n, d = self.level_size(), self.level_difficulty()
+            self.size, self.difficulty = n, d
+            level = level or self.first_unsolved(n, d)
+            self.status_only("Generating level %d (%dx%d %s)..." % (level, n, n, d), "Running cells...")
+            puzzle = level_puzzle(n, d, level)
+        else:
+            self.status_only("Generating a %dx%d %s puzzle..." % (self.size, self.size, self.difficulty),
+                             "Running cells...")
+            puzzle = generate(self.size, self.difficulty, seed)
+        self.new_game(puzzle)
+
+    def next_puzzle(self):
+        level = getattr(self.game.p, "level", None) if self.game else None
+        if self.mode == "level" and level:
+            n, d, i = level
+            if i >= LEVEL_COUNT:
+                self.open_levels()
+                self.say("You've finished every %dx%d %s level!" % (n, n, d), "", kind="good")
+                return
+            self.start("level", level=i + 1)
+        elif self.mode == "file":
+            self.start("file")
+        else:
+            self.start("quick")
+
+    def new_game(self, puzzle):
+        self.game = Game(puzzle, self.lives)
+        self.screen = "game"
+        self.confirm = None
         self.assign_colours(puzzle)
         self.flash = None
         self.in_no += 3
@@ -832,7 +944,28 @@ class App(object):
             self.say("Warning: this puzzle has more than one solution.",
                      "UserWarning: system is under-determined", kind="bad")
         else:
-            self.say("" if not first else "New here? Press ? for the rules and keys.", "")
+            self.say("", "")
+
+    def open_menu(self):
+        self.screen = "menu"
+        self.game = None
+        self.confirm = None
+        self.say("", "")
+
+    def leave_game(self):
+        """Back to wherever this puzzle was picked from."""
+        if self.mode == "level":
+            self.open_levels()
+        else:
+            self.open_menu()
+
+    def open_levels(self):
+        self.screen = "levels"
+        self.game = None
+        self.confirm = None
+        self.lv_focus = 2
+        self.lv_sel = self.first_unsolved(self.level_size(), self.level_difficulty()) - 1
+        self.say("", "")
 
     def say(self, normal, stealth=None, kind="info"):
         self.msg = (normal, normal if stealth is None else stealth)
@@ -862,6 +995,14 @@ class App(object):
             st["best"] = t
         if p.label.startswith("daily"):
             self.stats.setdefault("daily", {})[p.label[6:]] = t
+        level = getattr(p, "level", None)
+        if level:
+            n, d, i = level
+            pack = self.stats.setdefault("levels", {}).setdefault(level_key(n, d), {})
+            old = pack.get(str(i), {}).get("best")
+            clean = t if g.hints == 0 else None
+            if old is None or (clean is not None and clean < old):
+                pack[str(i)] = {"best": clean}  # None = solved, but with hints
         save_stats(self.stats)
         return new_best
 
@@ -885,19 +1026,23 @@ class App(object):
             x += len(text)
         return x
 
-    @staticmethod
-    def fmt_time(t):
-        t = int(t)
-        return "%d:%02d:%02d" % (t // 3600, t // 60 % 60, t % 60) if t >= 3600 else "%02d:%02d" % (t // 60, t % 60)
+    fmt_time = staticmethod(fmt_time)
 
     def draw(self):
         self.scr.erase()
         if self.flash and time.time() > self.flash[3]:
             self.flash = None
+        self.hits = []
         if self.boss:
             self.draw_boss()
         elif self.help:
             self.draw_help()
+        elif self.screen == "menu":
+            self.draw_menu()
+        elif self.screen == "levels":
+            self.draw_levels()
+        elif self.screen == "stats":
+            self.draw_stats()
         elif self.stealth:
             self.draw_stealth()
         else:
@@ -935,6 +1080,7 @@ class App(object):
         self.put(top + bh - 1, left, bl + hz * (width - 2) + br, line_attr)
         for i, segs in enumerate(lines):
             self.put_segments(top + 2 + i, left + 3, segs)
+        return top + 2, left + 3
 
     def draw_help(self):
         if self.stealth:
@@ -954,7 +1100,7 @@ class App(object):
         lines.append([])
         lines.append([("press any key to return", dim)])
         width = max(len(s) for s in RULES) + 6
-        self.draw_panel("purrgrid", lines, width)
+        self.draw_panel("meowdokuterm", lines, width)
 
     def draw_boss(self):
         self.boss.tick()
@@ -962,6 +1108,321 @@ class App(object):
         lines = self.boss.lines[-(h - 1):]
         for i, line in enumerate(lines):
             self.put(i, 0, line)
+
+    # -- menus --------------------------------------------------------------
+    def times(self, n):
+        return (u"%d×%d" if self.uni else "%dx%d") % (n, n)
+
+    def lives_text(self, v):
+        return str(v) if v > 0 else ("∞" if self.uni else "unlimited")
+
+    def daily_done(self):
+        return datetime.date.today().isoformat() in self.stats.get("daily", {})
+
+    def menu_info(self, item):
+        """Right-hand text for a main menu row."""
+        n, d = self.level_size(), self.level_difficulty()
+        if item == "play":
+            return "random %s %s" % (self.times(self.size), self.difficulty)
+        if item == "levels":
+            return "%s %s  %d/%d solved" % (self.times(n), d, len(level_progress(self.stats, n, d)),
+                                            LEVEL_COUNT)
+        if item == "daily":
+            return "solved today " + (u"✓" if self.uni else "(done)") if self.daily_done() \
+                else datetime.date.today().isoformat()
+        if item == "size":
+            return self.times(self.size)
+        if item == "difficulty":
+            return self.difficulty
+        if item == "lives":
+            return self.lives_text(self.lives)
+        return ""
+
+    MENU_LABELS = dict(play="Play", levels="Levels", daily="Daily puzzle", size="Board size",
+                       difficulty="Difficulty", lives="Lives", stats="Stats", help="How to play",
+                       quit="Quit")
+
+    def draw_menu(self):
+        if self.stealth:
+            return self.draw_stealth_menu()
+        bold, dim = curses.A_BOLD, self.dim()
+        left_a, right_a = (u"◀", u"▶") if self.uni else ("<", ">")
+        pointer = u"▸ " if self.uni else "> "
+        width = 50
+        lines = [[("Put one cat in every row, column and region.", dim)], []]
+        rows = {}
+        for i, item in enumerate(MENU_ITEMS):
+            sel = i == self.menu_sel
+            info = self.menu_info(item)
+            segs = [(pointer if sel else "  ", bold | self.cp(P_YELLOW)),
+                    ("%-14s" % self.MENU_LABELS[item], bold if sel else 0)]
+            if item in MENU_SETTINGS:
+                segs += [(left_a + " " if sel else "  ", self.cp(P_YELLOW)), (info, bold),
+                         (" " + right_a if sel else "", self.cp(P_YELLOW))]
+            elif info:
+                segs.append((info, dim))
+            rows[len(lines)] = i
+            lines.append(segs)
+            if item in ("daily", "lives"):
+                lines.append([])
+        lines.append([])
+        keys = [(u"↑↓" if self.uni else "up/dn", "choose"), (u"←→" if self.uni else "lt/rt", "change"),
+                ("Enter", "select"), ("q", "quit")]
+        segs = []
+        for k, v in keys:
+            segs += [(k, bold | self.cp(P_YELLOW)), (" " + v + "  ", dim)]
+        lines.append(segs)
+        h, w = self.scr.getmaxyx()
+        if self.too_small(len(lines) + 4, width):
+            return
+        y0, x0 = self.draw_panel("meowdokuterm", lines, width)
+        for li, i in rows.items():
+            self.hits.append((y0 + li, x0, width - 6, lambda i=i: self.menu_click(i)))
+
+    def draw_stealth_menu(self):
+        k = self.in_no
+        vals = dict(play="'run'", levels="'%d/%d done'" % (
+                        len(level_progress(self.stats, self.level_size(), self.level_difficulty())),
+                        LEVEL_COUNT),
+                    daily="'%s'" % datetime.date.today().isoformat(), size=str(self.size),
+                    difficulty="'%s'" % self.difficulty,
+                    lives=str(self.lives) if self.lives > 0 else "None",
+                    stats="<dict>", help="<doc>", quit="<exit>")
+        self.put(0, 0, "In [%d]: cfg = session.config()" % (k - 1))
+        self.put(2, 0, "In [%d]: cfg" % k)
+        self.put(3, 0, "Out[%d]:" % k)
+        for i, item in enumerate(MENU_ITEMS):
+            key = "%s'%s':" % ("{" if i == 0 else " ", item)
+            end = "}" if i == len(MENU_ITEMS) - 1 else ","
+            text = "%-15s %s%s" % (key, vals[item], end)
+            self.put(4 + i, 0, text, curses.A_REVERSE if i == self.menu_sel else 0)
+            self.hits.append((4 + i, 0, len(text), lambda i=i: self.menu_click(i)))
+        self.put(5 + len(MENU_ITEMS), 0, "In [%d]: " % (k + 1))
+
+    def menu_click(self, i):
+        self.menu_sel = i
+        self.menu_activate(1)
+
+    def menu_change(self, step):
+        item = MENU_ITEMS[self.menu_sel]
+        if item == "size":
+            self.size = min(MAX_N, max(MIN_N, self.size + step))
+        elif item == "difficulty":
+            opts = QUICK_DIFFICULTIES
+            self.difficulty = opts[(opts.index(self.difficulty) + step) % len(opts)]
+        elif item == "lives":
+            opts = list(LIVES_CHOICES)
+            if self.lives not in opts:
+                opts.append(self.lives)
+            self.lives = opts[(opts.index(self.lives) + step) % len(opts)]
+
+    def menu_activate(self, step=1):
+        """Enter on a menu row. Returns False to quit."""
+        item = MENU_ITEMS[self.menu_sel]
+        if item in MENU_SETTINGS:
+            if item == "size" and self.size == MAX_N and step > 0:
+                self.size = MIN_N
+            else:
+                self.menu_change(step)
+        elif item == "play":
+            self.start("quick")
+        elif item == "levels":
+            self.open_levels()
+        elif item == "daily":
+            self.start("daily")
+        elif item == "stats":
+            self.screen = "stats"
+        elif item == "help":
+            self.help = True
+        elif item == "quit":
+            return False
+        return True
+
+    def handle_menu(self, ch):
+        if ch in (curses.KEY_UP, ord("k"), ord("w")):
+            self.menu_sel = (self.menu_sel - 1) % len(MENU_ITEMS)
+        elif ch in (curses.KEY_DOWN, ord("j"), ord("s")):
+            self.menu_sel = (self.menu_sel + 1) % len(MENU_ITEMS)
+        elif ch in (curses.KEY_LEFT, ord("h"), ord("a")):
+            self.menu_change(-1)
+        elif ch in (curses.KEY_RIGHT, ord("l"), ord("d")):
+            self.menu_change(1)
+        elif ch in (10, 13, curses.KEY_ENTER, ord(" "), ord("c")):
+            return self.menu_activate()
+        elif ch == ord("p"):
+            self.start("quick")
+        elif ch == ord("L"):
+            self.open_levels()
+        elif ch in (ord("q"), 27):
+            return False
+        return True
+
+    def level_cell(self, i):
+        """Index (0-based) to the 1-based level number and grid position."""
+        return i + 1, divmod(i, LEVEL_COLS)
+
+    def draw_levels(self):
+        n, d = self.level_size(), self.level_difficulty()
+        done = level_progress(self.stats, n, d)
+        nxt = self.first_unsolved(n, d) if len(done) < LEVEL_COUNT else None
+        if self.stealth:
+            return self.draw_stealth_levels(n, d, done)
+        bold, dim = curses.A_BOLD, self.dim()
+        left_a, right_a = (u"◀", u"▶") if self.uni else ("<", ">")
+        pointer = u"▸ " if self.uni else "> "
+        tick = u"✓" if self.uni else "*"
+        width = 46
+        lines = []
+        for f, (label, value) in enumerate((("Board size", self.times(n)), ("Difficulty", d))):
+            sel = self.lv_focus == f
+            lines.append([(pointer if sel else "  ", bold | self.cp(P_YELLOW)),
+                          ("%-14s" % label, bold if sel else 0),
+                          (left_a + " " if sel else "  ", self.cp(P_YELLOW)), (value, bold),
+                          (" " + right_a if sel else "", self.cp(P_YELLOW))])
+        lines.append([])
+        grid_top = len(lines)
+        rows = (LEVEL_COUNT + LEVEL_COLS - 1) // LEVEL_COLS
+        for r in range(rows):
+            segs = [("  ", 0)]
+            for c in range(LEVEL_COLS):
+                i = r * LEVEL_COLS + c
+                if i >= LEVEL_COUNT:
+                    break
+                num = i + 1
+                text = " %2d %s " % (num, tick if num in done else " ")
+                if self.lv_focus == 2 and i == self.lv_sel:
+                    attr = (self.cp(P_CURSOR) | bold) if self.color else curses.A_REVERSE
+                elif num in done:
+                    attr = self.cp(P_GREEN) | bold
+                elif num == nxt:
+                    attr = self.cp(P_YELLOW) | bold
+                else:
+                    attr = dim
+                segs += [(text, attr), (" ", 0)]
+            lines.append(segs)
+        lines.append([])
+        num = self.lv_sel + 1
+        if num in done:
+            info = ("best " + fmt_time(done[num])) if done[num] is not None else "solved with hints"
+        else:
+            info = "not solved yet"
+        lines.append([("Level %d" % num, bold), ("  %s" % info, dim),
+                      ("   %d/%d solved" % (len(done), LEVEL_COUNT), self.cp(P_GREEN))])
+        if self.msg[0]:
+            lines.append([(self.msg[0], self.cp(P_GREEN) | bold)])
+        lines.append([])
+        segs = []
+        for k, v in (("Enter", "play"), (u"←↑↓→" if self.uni else "arrows", "move"), ("Esc", "back")):
+            segs += [(k, bold | self.cp(P_YELLOW)), (" " + v + "  ", dim)]
+        lines.append(segs)
+        if self.too_small(len(lines) + 4, width):
+            return
+        y0, x0 = self.draw_panel("levels", lines, width)
+        for f in (0, 1):
+            self.hits.append((y0 + f, x0, width - 6, lambda f=f: self.levels_focus_click(f)))
+        for i in range(LEVEL_COUNT):
+            r, c = divmod(i, LEVEL_COLS)
+            self.hits.append((y0 + grid_top + r, x0 + 2 + 7 * c, 6, lambda i=i: self.levels_click(i)))
+
+    def draw_stealth_levels(self, n, d, done):
+        k = self.in_no
+        y = 0
+        self.put(y, 0, "In [%d]: runs = sweep(" % k)
+        x = len("In [%d]: runs = sweep(" % k)
+        for f, text in enumerate(("k=%d" % n, ", ", "mode='%s'" % d, ")")):
+            focus = {0: 0, 2: 1}.get(f)
+            self.put(y, x, text, curses.A_REVERSE if focus is not None and focus == self.lv_focus else 0)
+            x += len(text)
+        y += 2
+        self.put(y, 0, "In [%d]: runs.ids" % (k + 1)); y += 1
+        self.put(y, 0, "Out[%d]:" % (k + 1)); y += 1
+        rows = (LEVEL_COUNT + LEVEL_COLS - 1) // LEVEL_COLS
+        for r in range(rows):
+            prefix = "array([[" if r == 0 else "       ["
+            self.put(y, 0, prefix)
+            x = len(prefix)
+            for c in range(LEVEL_COLS):
+                i = r * LEVEL_COLS + c
+                if i >= LEVEL_COUNT:
+                    break
+                a = curses.A_BOLD if (i + 1) in done else 0
+                if self.lv_focus == 2 and i == self.lv_sel:
+                    a |= curses.A_REVERSE
+                self.put(y, x, "%2d" % (i + 1), a)
+                self.hits.append((y, x, 2, lambda i=i: self.levels_click(i)))
+                x += 2
+                if c < LEVEL_COLS - 1 and i < LEVEL_COUNT - 1:
+                    self.put(y, x, ", ")
+                    x += 2
+            self.put(y, x, "]," if r < rows - 1 else "]])")
+            y += 1
+        y += 1
+        self.put(y, 0, "# %d/%d converged" % (len(done), LEVEL_COUNT)); y += 2
+        self.put(y, 0, "In [%d]: " % (k + 2))
+
+    def levels_focus_click(self, f):
+        self.lv_focus = f
+        self.levels_change(1)
+
+    def levels_click(self, i):
+        self.lv_focus = 2
+        self.lv_sel = i
+        self.start("level", level=i + 1)
+
+    def levels_change(self, step):
+        if self.lv_focus == 0:
+            i = LEVEL_SIZES.index(self.level_size())
+            self.size = LEVEL_SIZES[(i + step) % len(LEVEL_SIZES)]
+        else:
+            i = DIFFICULTIES.index(self.level_difficulty())
+            self.difficulty = DIFFICULTIES[(i + step) % len(DIFFICULTIES)]
+        self.lv_sel = self.first_unsolved(self.level_size(), self.level_difficulty()) - 1
+
+    def handle_levels(self, ch):
+        self.say("", "")
+        up = ch in (curses.KEY_UP, ord("k"), ord("w"))
+        down = ch in (curses.KEY_DOWN, ord("j"), ord("s"))
+        left = ch in (curses.KEY_LEFT, ord("h"), ord("a"))
+        right = ch in (curses.KEY_RIGHT, ord("l"), ord("d"))
+        enter = ch in (10, 13, curses.KEY_ENTER, ord(" "), ord("c"))
+        if ch in (27, ord("m"), ord("q"), curses.KEY_BACKSPACE, 127):
+            self.open_menu()
+        elif self.lv_focus < 2:
+            if up:
+                self.lv_focus = max(0, self.lv_focus - 1)
+            elif down or enter:
+                self.lv_focus += 1
+            elif left or right:
+                self.levels_change(-1 if left else 1)
+        else:
+            r, c = divmod(self.lv_sel, LEVEL_COLS)
+            if up:
+                if r == 0:
+                    self.lv_focus = 1
+                else:
+                    self.lv_sel -= LEVEL_COLS
+            elif down:
+                self.lv_sel = min(LEVEL_COUNT - 1, self.lv_sel + LEVEL_COLS)
+            elif left:
+                self.lv_sel = (self.lv_sel - 1) % LEVEL_COUNT
+            elif right:
+                self.lv_sel = (self.lv_sel + 1) % LEVEL_COUNT
+            elif enter:
+                self.start("level", level=self.lv_sel + 1)
+        return True
+
+    def draw_stats(self):
+        lines = stats_lines(self.stats) or ["No puzzles solved yet."]
+        if self.stealth:
+            self.put(0, 0, "In [%d]: session.stats" % self.in_no)
+            self.put(1, 0, "Out[%d]:" % self.in_no)
+            for i, line in enumerate(lines):
+                self.put(2 + i, 0, "  " + line)
+            return
+        segs = [[(s, 0)] for s in lines] + [[], [("press any key to return", self.dim())]]
+        width = max(40, max(len(s) for s in lines) + 6)
+        if not self.too_small(len(segs) + 4, width):
+            self.draw_panel("stats", segs, width)
 
     # -- the board ----------------------------------------------------------
     def region_attr(self, reg):
@@ -1156,20 +1617,23 @@ class App(object):
         bold, dim = curses.A_BOLD, self.dim()
 
         # header: title + info on the left, lives + timer on the right
-        name = " purrgrid " if self.rich else "purrgrid"
+        name = " meowdokuterm " if self.rich else "meowdokuterm"
         info = [("  %d×%d" % (n, n) if self.uni else "  %dx%d" % (n, n), 0),
                 (gl["sep"] + p.difficulty, dim)]
         if p.label:
             info.append((gl["sep"] + p.label, dim))
         elif p.seed is not None:
             info.append((gl["sep"] + "#%s" % p.seed, dim))
-        self.put_segments(top, left, [(name, (self.cp(P_TITLE) | bold) if self.rich else bold)] + info)
         if g.max_lives > 0:
             hearts = " ".join([gl["heart"]] * g.lives + [gl["heart_off"]] * (g.max_lives - g.lives))
         else:
             hearts = ""
         clock = self.fmt_time(g.elapsed())
         right = len(hearts) + 3 + len(clock)
+        # rather than run into the lives/clock, drop the seed, or the difficulty before a label
+        while len(info) > 1 and len(name) + sum(len(t) for t, _ in info) + right + 1 > box_w:
+            info.pop(1 if p.label else -1)
+        self.put_segments(top, left, [(name, (self.cp(P_TITLE) | bold) if self.rich else bold)] + info)
         self.put_segments(top, left + box_w - right,
                           [(hearts, self.cp(P_RED) | bold), ("   ", 0), (clock, bold)])
 
@@ -1204,10 +1668,11 @@ class App(object):
         # key hints
         if g.state == "play":
             # least important last: they are dropped first on narrow terminals
-            keys = [("c", "cat"), ("x", "mark"), ("?", "help"), ("b", "boss"), ("Tab", "stealth"),
-                    ("u", "undo"), ("H", "hint")]
+            keys = [("c", "cat"), ("x", "mark"), ("?", "help"), ("m", "menu"), ("b", "boss"),
+                    ("Tab", "stealth"), ("u", "undo"), ("H", "hint")]
         else:
-            keys = [("n", "next puzzle"), ("r", "retry"), ("Tab", "stealth"), ("q", "quit")]
+            nxt = "next level" if self.mode == "level" else "next puzzle"
+            keys = [("n", nxt), ("r", "retry"), ("m", "menu"), ("q", "quit"), ("Tab", "stealth")]
         while True:
             segs = []
             for i, (k, v) in enumerate(keys):
@@ -1269,7 +1734,8 @@ class App(object):
         y += 1
         self.put(y, 0, "In [%d]: " % (k + 2))
         if self.confirm:
-            self.put(y + 1, 0, "Do you really want to exit ([y]/n)? ")
+            self.put(y + 1, 0, "Do you really want to %s ([y]/n)? "
+                     % ("exit" if self.confirm == "quit" else "restart the kernel"))
 
     # -- input ------------------------------------------------------------
     def move(self, dr, dc):
@@ -1296,8 +1762,10 @@ class App(object):
                      "ConvergenceError: tol exhausted (r: rerun, n: next block)", kind="bad")
         elif res == "won":
             best = self.record_win()
-            self.say("Purrfect! Solved in %s%s" %
-                     (self.fmt_time(g.elapsed()), " - a new best!" if best else "."), "", kind="good")
+            level = getattr(g.p, "level", None)
+            what = ("Level %d done" % level[2]) if level else "Solved"
+            self.say("Purrfect! %s in %s%s" %
+                     (what, self.fmt_time(g.elapsed()), " - a new best!" if best else "."), "", kind="good")
         elif res == "ok":
             self.say("", "")
 
@@ -1308,7 +1776,13 @@ class App(object):
         try:
             _, mx, my, _, bstate = curses.getmouse()
         except curses.error:
-            return
+            return True
+        if self.screen != "game":
+            if bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                for y, x, w, action in self.hits:
+                    if my == y and x <= mx < x + w:
+                        return action() is not False
+            return True
         for (r, c), (y, x, w) in self.cellpos.items():
             if my == y and x <= mx < x + w:
                 self.game.cur = [r, c]
@@ -1316,22 +1790,51 @@ class App(object):
                     self.do_cat(r, c)
                 elif bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED):
                     self.game.toggle_mark(r, c)
-                return
+                return True
+        return True
 
     def handle(self, ch):
         g = self.game
         if self.boss:
             if ch == ord("b"):
                 self.boss = None
-                g.resume()
+                if g:
+                    g.resume()
             return True
         if self.help:
             self.help = False
-            g.resume()
+            if g:
+                g.resume()
+            return True
+        # keys that work on every screen
+        if ch == 9:
+            self.stealth = not self.stealth
+            return True
+        if ch == ord("b"):
+            if g:
+                g.pause()
+            self.boss = FakeLog()
+            return True
+        if ch == ord("?"):
+            if g:
+                g.pause()
+            self.help = True
+            return True
+        if ch == curses.KEY_MOUSE:
+            return self.handle_mouse()
+        if self.screen == "menu":
+            return self.handle_menu(ch)
+        if self.screen == "levels":
+            return self.handle_levels(ch)
+        if self.screen == "stats":
+            self.screen = "menu"
             return True
         if self.confirm:
             if ch in (ord("y"), ord("Y"), 10, 13):
-                return False
+                if self.confirm == "quit":
+                    return False
+                self.leave_game()
+                return True
             self.confirm = None
             self.say("", "")
             return True
@@ -1379,26 +1882,22 @@ class App(object):
             self.letters = not self.letters
         elif ch == ord("B"):
             self.borders = not self.borders
-        elif ch == 9:
-            self.stealth = not self.stealth
-        elif ch == ord("b"):
-            g.pause()
-            self.boss = FakeLog()
-        elif ch == ord("?"):
-            g.pause()
-            self.help = True
         elif ch == ord("r"):
-            self.new_game(puzzle=g.p)
+            self.new_game(g.p)
         elif ch == ord("n"):
-            self.new_game()
-        elif ch in (ord("q"), 27):
+            self.next_puzzle()
+        elif ch in (ord("m"), 27):
+            if g.state == "play" and g.cats() > 0:
+                self.confirm = "menu"
+                self.say("Leave this puzzle for the menu?  y / n", "", kind="bad")
+            else:
+                self.leave_game()
+        elif ch == ord("q"):
             if g.state == "play" and g.cats() > 0:
                 self.confirm = "quit"
                 self.say("Quit and lose this puzzle?  y / n", "", kind="bad")
             else:
                 return False
-        elif ch == curses.KEY_MOUSE:
-            self.handle_mouse()
         return True
 
     def run(self):
@@ -1424,7 +1923,7 @@ def size_arg(s):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        prog="purrgrid",
+        prog="meshcheck",
         description="Cat-placement logic puzzle for the terminal. One cat per row, column "
                     "and region; cats may not touch, even diagonally.")
     ap.add_argument("-s", "--size", type=size_arg, default=8, help="board size N (4-14, default 8)")
@@ -1432,6 +1931,9 @@ def main(argv=None):
                     help="difficulty (default medium)")
     ap.add_argument("--seed", type=int, help="seed for a reproducible puzzle")
     ap.add_argument("--daily", action="store_true", help="play today's daily puzzle (8x8 medium)")
+    ap.add_argument("--level", type=int, metavar="N",
+                    help="play level N (1-%d) of the -s/-d level pack, skipping the menu" % LEVEL_COUNT)
+    ap.add_argument("--play", action="store_true", help="skip the menu and start a random puzzle")
     ap.add_argument("--lives", type=int, default=3, help="lives per puzzle, 0 = unlimited (default 3)")
     ap.add_argument("--stealth", action="store_true", help="start in stealth mode (Tab toggles)")
     ap.add_argument("--no-color", action="store_true", help="monochrome; uses borders and letters")
@@ -1447,20 +1949,21 @@ def main(argv=None):
     ap.add_argument("--load", metavar="FILE", help="play puzzles from a text file (see --print)")
     ap.add_argument("--index", type=int, help="with --load, start at puzzle number INDEX (1-based)")
     ap.add_argument("--stats", action="store_true", help="show your solve stats and exit")
-    ap.add_argument("--version", action="version", version="purrgrid " + VERSION)
+    ap.add_argument("--version", action="version", version="meshcheck " + VERSION)
     args = ap.parse_args(argv)
+    if args.level is not None:
+        if not 1 <= args.level <= LEVEL_COUNT:
+            ap.error("--level must be between 1 and %d" % LEVEL_COUNT)
+        if args.size not in LEVEL_SIZES or args.difficulty not in DIFFICULTIES:
+            ap.error("levels exist for sizes %d-%d and difficulties %s"
+                     % (LEVEL_SIZES[0], LEVEL_SIZES[-1], "/".join(DIFFICULTIES)))
 
     if args.stats:
         st = load_stats()
         if not st:
             print("No puzzles solved yet. Stats live in " + stats_path())
-        for k in sorted(st):
-            if k == "daily":
-                print("daily puzzles solved: %d" % len(st[k]))
-            else:
-                best = st[k]["best"]
-                print("%-14s solved %4d   best %s" % (k, st[k]["solved"],
-                                                      App.fmt_time(best) if best is not None else "-"))
+        for line in stats_lines(st):
+            print(line)
         return 0
 
     if args.print_n:
@@ -1474,19 +1977,19 @@ def main(argv=None):
         return 0
 
     if curses is None:
-        print("This Python has no curses module, so purrgrid can't draw the board.\n"
+        print("This Python has no curses module, so meshcheck can't draw the board.\n"
               "Try another python3 (e.g. /usr/bin/python3, `module load python`, or conda).\n"
               "(--print still works without it.)", file=sys.stderr)
         return 1
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
-    source = Source(args)
+    file_source = FileSource(args.load, args.index) if args.load else None
     if not sys.stdout.isatty():
-        print("purrgrid needs an interactive terminal (use --print to generate puzzles).", file=sys.stderr)
+        print("meshcheck needs an interactive terminal (use --print to generate puzzles).", file=sys.stderr)
         return 1
 
     def _run(scr):
-        App(scr, args, source).run()
+        App(scr, args, file_source).run()
 
     try:
         curses.wrapper(_run)

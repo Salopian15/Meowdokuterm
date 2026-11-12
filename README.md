@@ -1,4 +1,4 @@
-# purrgrid
+# meowdokuterm
 
 A cat-placement logic puzzle for the terminal (Linux and macOS).
 
@@ -9,25 +9,43 @@ Every puzzle has exactly one solution, and a wrong cat costs one of your 3 lives
 ## Install (no root, nothing to download)
 
 It's a single Python 3.6+ file that uses only the standard library (`curses`).
+The file and command are called **`meshcheck`**, so on a shared cluster `ps`/`top`
+just shows something that looks like a mesh-validation tool.
 
 ```sh
-sh install.sh          # copies it to ~/.local/bin/purrgrid
-purrgrid
+sh install.sh          # copies it to ~/.local/bin/meshcheck
+meshcheck
 ```
 
-Or just run `python3 purrgrid.py`. If your cluster's default `python3` was built
+Or just run `python3 meshcheck.py`. If your cluster's default `python3` was built
 without curses, try `/usr/bin/python3`, `module load python`, or a conda Python.
 
 ## Playing
 
+`meshcheck` opens a menu:
+
+* **Play:** a fresh random puzzle at the chosen size and difficulty.
+* **Levels:** 20 numbered levels for every size (5×5 to 12×12) and difficulty.
+  Levels are the same on every machine, solved ones get a ✓ and your best time,
+  and `n` after a win takes you to the next level.
+* **Daily puzzle:** the same 8×8 puzzle for everyone today.
+* **Board size / Difficulty / Lives:** change with ←/→.
+* **Stats** and **How to play**.
+
+Use the arrow keys (or `hjkl`) and Enter, or click with the mouse. In a puzzle, `m` or
+Esc goes back to the menu. Tab (stealth) and `b` (boss key) work on every screen.
+
+You can also skip the menu:
+
 ```sh
-purrgrid                       # 8x8, medium
-purrgrid -s 10 -d hard         # sizes 4-14; easy / medium / hard / any
-purrgrid --seed 1234           # reproducible puzzle (seed shown in the header)
-purrgrid --daily               # same 8x8 puzzle for everyone today
-purrgrid --stealth             # start in stealth mode
-purrgrid --lives 0             # no lives limit
-purrgrid --stats               # best times
+meshcheck -s 10 -d hard            # preselect size 4-14 and easy / medium / hard / any
+meshcheck --play                   # straight into a random puzzle
+meshcheck --level 3 -s 8 -d hard   # straight into level 3 of the 8x8 hard levels
+meshcheck --seed 1234              # reproducible puzzle (seed shown in the header)
+meshcheck --daily                  # today's daily puzzle
+meshcheck --stealth                # start in stealth mode
+meshcheck --lives 0                # no lives limit
+meshcheck --stats                  # best times and level progress
 ```
 
 | Key | Action |
@@ -43,7 +61,9 @@ purrgrid --stats               # best times
 | `B` / `L` | region borders / region letters |
 | **Tab** | **stealth mode** |
 | **`b`** | **boss key** |
-| `n` / `r` / `q` | new puzzle / restart / quit |
+| `n` / `r` | next puzzle (or level) / restart |
+| `m` / Esc | back to the menu |
+| `q` | quit |
 
 ### Not looking like you're skiving
 
@@ -58,9 +78,9 @@ purrgrid --stats               # best times
 ## Level generator
 
 ```sh
-purrgrid --print 20 -s 9 -d hard > hard9.txt              # 20 puzzles as text
-purrgrid --print 5 -s 8 --solutions                       # with answer keys
-purrgrid --load hard9.txt --index 3                       # play from a file (n = next)
+meshcheck --print 20 -s 9 -d hard > hard9.txt              # 20 puzzles as text
+meshcheck --print 5 -s 8 --solutions                       # with answer keys
+meshcheck --load hard9.txt --index 3                       # play from a file (n = next)
 ```
 
 The file format is one letter per region, with puzzles separated by blank lines, so
@@ -76,4 +96,5 @@ Difficulty is rated by solving like a person would:
 Generation takes under a second for 8×8 up to 10×10. 12×12 and larger can take
 several seconds.
 
-Stats are saved in `~/.local/share/purrgrid/stats.json`.
+Stats and level progress are saved in `~/.local/share/meshcheck/stats.json`
+(stats from the old `purrgrid` name are picked up automatically).
