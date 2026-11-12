@@ -13,12 +13,18 @@ The file and command are called **`meshcheck`**, so on a shared cluster `ps`/`to
 just shows something that looks like a mesh-validation tool.
 
 ```sh
-sh install.sh          # copies it to ~/.local/bin/meshcheck
+sh install.sh                          # installs ~/.local/bin/meshcheck
 meshcheck
+sh install.sh --uninstall              # removes it again (stats are kept)
+PYTHON=/path/to/python3 sh install.sh  # use a specific Python
 ```
 
-Or just run `python3 meshcheck.py`. If your cluster's default `python3` was built
-without curses, try `/usr/bin/python3`, `module load python`, or a conda Python.
+Cluster Pythons are often built without `curses`. The installer searches for a Python 3.6+
+that has it (`python3`, `/usr/bin/python3`, `python3.x`, ...), makes `meshcheck` always run
+with that one, and stops with a clear message if it can't find any. If that happens,
+try `module load python` or activating conda first.
+
+Or skip installing and run `python3 meshcheck.py`.
 
 ## Playing
 
@@ -31,6 +37,11 @@ without curses, try `/usr/bin/python3`, `module load python`, or a conda Python.
 * **Daily puzzle:** the same 8×8 puzzle for everyone today.
 * **Board size / Difficulty / Lives:** change with ←/→.
 * **Stats** and **How to play**.
+* **Continue:** appears when you have an unfinished puzzle.
+
+Your puzzle is saved as you play, so quitting (`q`), going back to the menu, Ctrl-C, or
+your SSH connection dropping never loses it. Pick **Continue** (or run `meshcheck --resume`)
+to carry on with the same board, lives and timer.
 
 Use the arrow keys (or `hjkl`) and Enter, or click with the mouse. In a puzzle, `m` or
 Esc goes back to the menu. Tab (stealth) and `b` (boss key) work on every screen.
@@ -40,6 +51,7 @@ You can also skip the menu:
 ```sh
 meshcheck -s 10 -d hard            # preselect size 4-14 and easy / medium / hard / any
 meshcheck --play                   # straight into a random puzzle
+meshcheck --resume                 # straight back into your unfinished puzzle
 meshcheck --level 3 -s 8 -d hard   # straight into level 3 of the 8x8 hard levels
 meshcheck --seed 1234              # reproducible puzzle (seed shown in the header)
 meshcheck --daily                  # today's daily puzzle
@@ -96,5 +108,15 @@ Difficulty is rated by solving like a person would:
 Generation takes under a second for 8×8 up to 10×10. 12×12 and larger can take
 several seconds.
 
-Stats and level progress are saved in `~/.local/share/meshcheck/stats.json`
-(stats from the old `purrgrid` name are picked up automatically).
+Everything is saved in `~/.local/share/meshcheck/`: `stats.json` (stats and level progress;
+stats from the old `purrgrid` name are picked up automatically), `session.json` (your
+unfinished puzzle) and `levels.json` (levels already generated, so they open instantly;
+the next level is generated in the background while you play the current one).
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+They also run on GitHub Actions for every push (Linux and macOS, Python 3.9 and 3.13).

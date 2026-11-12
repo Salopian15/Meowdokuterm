@@ -19,7 +19,9 @@ import json
 import locale
 import os
 import random
+import signal
 import sys
+import threading
 import time
 
 try:
@@ -338,11 +340,29 @@ def generate(n, difficulty="medium", seed=None, max_tries=600, budget=None):
 
 def level_puzzle(n, difficulty, level):
     """Level `level` (1-based) of a pack. No time budget, so every machine
-    generates exactly the same board."""
-    p = generate(n, difficulty, LEVEL_SEED_BASE + level, max_tries=300, budget=float("inf"))
+    generates exactly the same board. Generated levels are cached on disk."""
+    p = cached_level(n, difficulty, level)
+    if p is None:
+        p = generate(n, difficulty, LEVEL_SEED_BASE + level, max_tries=300, budget=float("inf"))
+        store_level(n, difficulty, level, p)
     p.label = "level %d" % level
     p.level = (n, difficulty, level)
     return p
+
+
+def prefetch_level(n, difficulty, level):
+    """Generate a level into the cache in the background, so it opens instantly."""
+    if level > LEVEL_COUNT or cached_level(n, difficulty, level) is not None:
+        return
+
+    def work():
+        try:
+            level_puzzle(n, difficulty, level)
+        except Exception:
+            pass
+    t = threading.Thread(target=work)
+    t.daemon = True
+    t.start()
 
 
 def daily_puzzle(day=None):
@@ -412,23 +432,143 @@ def parse_puzzles(text):
 
 
 # ---------------------------------------------------------------------------
-# Stats
+# Saved data: stats, the unfinished game, cached levels
 # ---------------------------------------------------------------------------
 
-def stats_path(name="meshcheck"):
+def data_path(filename, name="meshcheck"):
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, name, "stats.json")
+    return os.path.join(base, name, filename)
+
+
+def stats_path(name="meshcheck"):
+    return data_path("stats.json", name)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_json(path, obj, indent=1):
+    """Atomic write; safe with the background level generator writing too."""
+    try:
+        d = os.path.dirname(path)
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.current_thread().ident or 0)
+        with open(tmp, "w") as f:
+            json.dump(obj, f, indent=indent, sort_keys=True)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
 
 
 def load_stats():
     # fall back to stats saved under the project's old name (purrgrid)
     for path in (stats_path(), stats_path("purrgrid")):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            pass
+        st = read_json(path)
+        if isinstance(st, dict):
+            return st
     return {}
+
+
+def puzzle_to_dict(p):
+    return dict(n=p.n, regions=["".join(LETTERS[k] for k in row) for row in p.regions],
+                solution=list(p.solution), seed=p.seed, difficulty=p.difficulty, label=p.label,
+                level=list(p.level) if getattr(p, "level", None) else None,
+                ambiguous=bool(getattr(p, "ambiguous", False)))
+
+
+def puzzle_from_dict(d):
+    n = int(d["n"])
+    regions = [[LETTERS.index(ch) for ch in row] for row in d["regions"]]
+    solution = [int(c) for c in d["solution"]]
+    if len(regions) != n or any(len(row) != n for row in regions) or len(solution) != n:
+        raise ValueError("bad puzzle")
+    p = Puzzle(n, regions, solution, d.get("seed"), d.get("difficulty"), d.get("label") or "")
+    if d.get("level"):
+        p.level = (int(d["level"][0]), d["level"][1], int(d["level"][2]))
+    p.ambiguous = bool(d.get("ambiguous"))
+    return p
+
+
+# Bump when the generator changes, so stale cached levels are thrown away.
+LEVEL_CACHE_VERSION = 1
+_cache_lock = threading.Lock()
+
+
+def level_cache_path():
+    return data_path("levels.json")
+
+
+def cached_level(n, difficulty, level):
+    with _cache_lock:
+        cache = read_json(level_cache_path())
+    if not isinstance(cache, dict) or cache.get("version") != LEVEL_CACHE_VERSION:
+        return None
+    d = cache.get(level_key(n, difficulty), {}).get(str(level))
+    try:
+        return puzzle_from_dict(d) if d else None
+    except Exception:
+        return None
+
+
+def store_level(n, difficulty, level, p):
+    with _cache_lock:
+        cache = read_json(level_cache_path())
+        if not isinstance(cache, dict) or cache.get("version") != LEVEL_CACHE_VERSION:
+            cache = {"version": LEVEL_CACHE_VERSION}
+        d = puzzle_to_dict(p)
+        d.pop("label")
+        d.pop("level")
+        cache.setdefault(level_key(n, difficulty), {})[str(level)] = d
+        write_json(level_cache_path(), cache, indent=None)
+
+
+def session_path():
+    return data_path("session.json")
+
+
+def save_session(game, mode):
+    g = game
+    return write_json(session_path(), dict(
+        puzzle=puzzle_to_dict(g.p), mode=mode, grid=g.grid, cur=g.cur, lives=g.lives,
+        max_lives=g.max_lives, hints=g.hints, mistakes=g.mistakes, elapsed=round(g.elapsed(), 1),
+        saved=datetime.datetime.now().isoformat(timespec="seconds")))
+
+
+def load_session():
+    """(Game, mode) for the unfinished puzzle, or None."""
+    d = read_json(session_path())
+    if not isinstance(d, dict):
+        return None
+    try:
+        p = puzzle_from_dict(d["puzzle"])
+        g = Game(p, int(d["max_lives"]))
+        n = p.n
+        grid = [[int(v) for v in row] for row in d["grid"]]
+        if len(grid) != n or any(len(row) != n or not set(row) <= {EMPTY, MARK, CAT} for row in grid):
+            raise ValueError("bad grid")
+        g.grid = grid
+        g.cur = [int(d["cur"][0]) % n, int(d["cur"][1]) % n]
+        g.lives = int(d["lives"])
+        g.hints = int(d.get("hints", 0))
+        g.mistakes = int(d.get("mistakes", 0))
+        g.t0 = time.time() - float(d.get("elapsed", 0))
+        return g, d.get("mode") or "quick"
+    except Exception:
+        return None
+
+
+def clear_session():
+    try:
+        os.remove(session_path())
+    except OSError:
+        pass
 
 
 def level_key(n, difficulty):
@@ -462,17 +602,7 @@ def fmt_time(t):
 
 
 def save_stats(st):
-    try:
-        path = stats_path()
-        d = os.path.dirname(path)
-        if not os.path.isdir(d):
-            os.makedirs(d)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(st, f, indent=1, sort_keys=True)
-        os.replace(tmp, path)
-    except Exception:
-        pass
+    write_json(stats_path(), st)
 
 
 # ---------------------------------------------------------------------------
@@ -775,12 +905,13 @@ class App(object):
         self.borders = not args.compact
         self.help = False
         self.boss = None
-        self.confirm = None
         self.msg = ("", "")
         self.msg_kind = "info"
         self.flash = None  # (r, c, kind, until)
         self.cellpos = {}
         self.stats = load_stats()
+        self.saved = load_session()  # (Game, mode) of the unfinished puzzle, or None
+        self.last_save = None
         self.in_no = random.randint(17, 64)
         enc = (locale.getpreferredencoding() or "").lower()
         self.uni = "utf" in enc and not args.ascii
@@ -788,7 +919,9 @@ class App(object):
         self.gl = GLYPHS[style]
         self.setup_curses()
         self.say("", "")
-        if file_source:
+        if args.resume and self.saved:
+            self.resume_saved()
+        elif file_source:
             self.start("file")
         elif args.daily:
             self.start("daily")
@@ -796,6 +929,8 @@ class App(object):
             self.start("level", level=args.level)
         elif args.seed is not None or args.play:
             self.start("quick", seed=args.seed)
+        elif args.resume:
+            self.say("No unfinished puzzle to continue.", "")
 
     # -- setup ------------------------------------------------------------
     def setup_curses(self):
@@ -913,6 +1048,7 @@ class App(object):
             level = level or self.first_unsolved(n, d)
             self.status_only("Generating level %d (%dx%d %s)..." % (level, n, n, d), "Running cells...")
             puzzle = level_puzzle(n, d, level)
+            prefetch_level(n, d, level + 1)
         else:
             self.status_only("Generating a %dx%d %s puzzle..." % (self.size, self.size, self.difficulty),
                              "Running cells...")
@@ -933,10 +1069,9 @@ class App(object):
         else:
             self.start("quick")
 
-    def new_game(self, puzzle):
-        self.game = Game(puzzle, self.lives)
+    def new_game(self, puzzle, game=None):
+        self.game = game or Game(puzzle, self.lives)
         self.screen = "game"
-        self.confirm = None
         self.assign_colours(puzzle)
         self.flash = None
         self.in_no += 3
@@ -946,10 +1081,42 @@ class App(object):
         else:
             self.say("", "")
 
-    def open_menu(self):
-        self.screen = "menu"
+    def resume_saved(self):
+        game, mode = self.saved
+        self.mode = mode if mode != "file" or self.file_source else "quick"
+        level = getattr(game.p, "level", None)
+        if level:
+            self.size, self.difficulty = level[0], level[1]
+            prefetch_level(level[0], level[1], level[2] + 1)
+        self.new_game(game.p, game)
+        self.say("Welcome back! Picked up where you left off.", "")
+
+    def autosave(self, force=False):
+        """Keep session.json in step with the unfinished puzzle (cheap: only on change)."""
+        g = self.game
+        if g is None or self.screen != "game":
+            return
+        if g.state != "play":
+            if self.saved:
+                clear_session()
+                self.saved = None
+            return
+        key = (str(g.grid), g.lives, g.hints, tuple(g.cur))
+        if force or key != self.last_save:
+            if save_session(g, self.mode):
+                self.last_save = key
+                self.saved = (g, self.mode)
+
+    def leave_puzzle(self):
+        """Stop playing the current puzzle; it stays saved for Continue."""
+        self.autosave(force=True)
         self.game = None
-        self.confirm = None
+        self.last_save = None
+
+    def open_menu(self):
+        self.leave_puzzle()
+        self.screen = "menu"
+        self.menu_sel = 0
         self.say("", "")
 
     def leave_game(self):
@@ -960,9 +1127,8 @@ class App(object):
             self.open_menu()
 
     def open_levels(self):
+        self.leave_puzzle()
         self.screen = "levels"
-        self.game = None
-        self.confirm = None
         self.lv_focus = 2
         self.lv_sel = self.first_unsolved(self.level_size(), self.level_difficulty()) - 1
         self.say("", "")
@@ -1119,9 +1285,19 @@ class App(object):
     def daily_done(self):
         return datetime.date.today().isoformat() in self.stats.get("daily", {})
 
+    def menu_items(self):
+        return (("continue",) if self.saved else ()) + MENU_ITEMS
+
     def menu_info(self, item):
         """Right-hand text for a main menu row."""
         n, d = self.level_size(), self.level_difficulty()
+        if item == "continue" and self.saved:
+            g = self.saved[0]
+            what = g.p.label.split(" #")[0] if getattr(g.p, "level", None) else \
+                "daily" if g.p.label.startswith("daily") else g.p.difficulty
+            # fits the menu box even at "12×12 level 12  10/12  1:02:03"
+            return ("%s %s  %d/%d  %s" % (self.times(g.p.n), what, g.cats(), g.p.n,
+                                          fmt_time(g.elapsed())))[:30]
         if item == "play":
             return "random %s %s" % (self.times(self.size), self.difficulty)
         if item == "levels":
@@ -1151,11 +1327,11 @@ class App(object):
         width = 50
         lines = [[("Put one cat in every row, column and region.", dim)], []]
         rows = {}
-        for i, item in enumerate(MENU_ITEMS):
+        for i, item in enumerate(self.menu_items()):
             sel = i == self.menu_sel
             info = self.menu_info(item)
             segs = [(pointer if sel else "  ", bold | self.cp(P_YELLOW)),
-                    ("%-14s" % self.MENU_LABELS[item], bold if sel else 0)]
+                    ("%-14s" % self.MENU_LABELS.get(item, item.title()), bold if sel else 0)]
             if item in MENU_SETTINGS:
                 segs += [(left_a + " " if sel else "  ", self.cp(P_YELLOW)), (info, bold),
                          (" " + right_a if sel else "", self.cp(P_YELLOW))]
@@ -1163,7 +1339,7 @@ class App(object):
                 segs.append((info, dim))
             rows[len(lines)] = i
             lines.append(segs)
-            if item in ("daily", "lives"):
+            if item in ("continue", "daily", "lives"):
                 lines.append([])
         lines.append([])
         keys = [(u"↑↓" if self.uni else "up/dn", "choose"), (u"←→" if self.uni else "lt/rt", "change"),
@@ -1172,7 +1348,6 @@ class App(object):
         for k, v in keys:
             segs += [(k, bold | self.cp(P_YELLOW)), (" " + v + "  ", dim)]
         lines.append(segs)
-        h, w = self.scr.getmaxyx()
         if self.too_small(len(lines) + 4, width):
             return
         y0, x0 = self.draw_panel("meowdokuterm", lines, width)
@@ -1187,24 +1362,25 @@ class App(object):
                     daily="'%s'" % datetime.date.today().isoformat(), size=str(self.size),
                     difficulty="'%s'" % self.difficulty,
                     lives=str(self.lives) if self.lives > 0 else "None",
-                    stats="<dict>", help="<doc>", quit="<exit>")
+                    stats="<dict>", help="<doc>", quit="<exit>", **{"continue": "'restore'"})
         self.put(0, 0, "In [%d]: cfg = session.config()" % (k - 1))
         self.put(2, 0, "In [%d]: cfg" % k)
         self.put(3, 0, "Out[%d]:" % k)
-        for i, item in enumerate(MENU_ITEMS):
+        items = self.menu_items()
+        for i, item in enumerate(items):
             key = "%s'%s':" % ("{" if i == 0 else " ", item)
-            end = "}" if i == len(MENU_ITEMS) - 1 else ","
+            end = "}" if i == len(items) - 1 else ","
             text = "%-15s %s%s" % (key, vals[item], end)
             self.put(4 + i, 0, text, curses.A_REVERSE if i == self.menu_sel else 0)
             self.hits.append((4 + i, 0, len(text), lambda i=i: self.menu_click(i)))
-        self.put(5 + len(MENU_ITEMS), 0, "In [%d]: " % (k + 1))
+        self.put(5 + len(items), 0, "In [%d]: " % (k + 1))
 
     def menu_click(self, i):
         self.menu_sel = i
-        self.menu_activate(1)
+        return self.menu_activate(1)
 
     def menu_change(self, step):
-        item = MENU_ITEMS[self.menu_sel]
+        item = self.menu_items()[self.menu_sel]
         if item == "size":
             self.size = min(MAX_N, max(MIN_N, self.size + step))
         elif item == "difficulty":
@@ -1218,12 +1394,14 @@ class App(object):
 
     def menu_activate(self, step=1):
         """Enter on a menu row. Returns False to quit."""
-        item = MENU_ITEMS[self.menu_sel]
+        item = self.menu_items()[self.menu_sel]
         if item in MENU_SETTINGS:
             if item == "size" and self.size == MAX_N and step > 0:
                 self.size = MIN_N
             else:
                 self.menu_change(step)
+        elif item == "continue":
+            self.resume_saved()
         elif item == "play":
             self.start("quick")
         elif item == "levels":
@@ -1240,9 +1418,9 @@ class App(object):
 
     def handle_menu(self, ch):
         if ch in (curses.KEY_UP, ord("k"), ord("w")):
-            self.menu_sel = (self.menu_sel - 1) % len(MENU_ITEMS)
+            self.menu_sel = (self.menu_sel - 1) % len(self.menu_items())
         elif ch in (curses.KEY_DOWN, ord("j"), ord("s")):
-            self.menu_sel = (self.menu_sel + 1) % len(MENU_ITEMS)
+            self.menu_sel = (self.menu_sel + 1) % len(self.menu_items())
         elif ch in (curses.KEY_LEFT, ord("h"), ord("a")):
             self.menu_change(-1)
         elif ch in (curses.KEY_RIGHT, ord("l"), ord("d")):
@@ -1256,10 +1434,6 @@ class App(object):
         elif ch in (ord("q"), 27):
             return False
         return True
-
-    def level_cell(self, i):
-        """Index (0-based) to the 1-based level number and grid position."""
-        return i + 1, divmod(i, LEVEL_COLS)
 
     def draw_levels(self):
         n, d = self.level_size(), self.level_difficulty()
@@ -1609,7 +1783,7 @@ class App(object):
             bh, bw = self.board_size(n, borders)
         # without borders, regions are only told apart by colour
         use_letters = self.letters or (not borders and n > self.npal)
-        box_w = max(bw, 46)
+        box_w = max(bw, 52)
         if self.too_small(bh + 6, box_w + 2):
             return
         top = max(0, (h - (bh + 6)) // 2)
@@ -1733,9 +1907,6 @@ class App(object):
                 self.put(y, 0, line); y += 1
         y += 1
         self.put(y, 0, "In [%d]: " % (k + 2))
-        if self.confirm:
-            self.put(y + 1, 0, "Do you really want to %s ([y]/n)? "
-                     % ("exit" if self.confirm == "quit" else "restart the kernel"))
 
     # -- input ------------------------------------------------------------
     def move(self, dr, dc):
@@ -1829,15 +2000,6 @@ class App(object):
         if self.screen == "stats":
             self.screen = "menu"
             return True
-        if self.confirm:
-            if ch in (ord("y"), ord("Y"), 10, 13):
-                if self.confirm == "quit":
-                    return False
-                self.leave_game()
-                return True
-            self.confirm = None
-            self.say("", "")
-            return True
         r, c = g.cur
         if ch in (curses.KEY_UP, ord("k"), ord("w")):
             self.move(-1, 0)
@@ -1869,8 +2031,10 @@ class App(object):
                 (hr, hc), outcome = res
                 if outcome == "won":
                     self.record_win()
-                    self.say("Solved in %s (with %d hint%s)." % (self.fmt_time(g.elapsed()), g.hints,
-                                                                  "s" if g.hints > 1 else ""), "", kind="good")
+                    level = getattr(g.p, "level", None)
+                    self.say("%s in %s (with %d hint%s)." % (
+                        ("Level %d done" % level[2]) if level else "Solved", self.fmt_time(g.elapsed()),
+                        g.hints, "s" if g.hints > 1 else ""), "", kind="good")
                 else:
                     self.flash = (hr, hc, "good", time.time() + 0.9)
                     self.say("Hint: there's a cat at row %d, column %d." % (hr + 1, hc + 1),
@@ -1887,27 +2051,24 @@ class App(object):
         elif ch == ord("n"):
             self.next_puzzle()
         elif ch in (ord("m"), 27):
-            if g.state == "play" and g.cats() > 0:
-                self.confirm = "menu"
-                self.say("Leave this puzzle for the menu?  y / n", "", kind="bad")
-            else:
-                self.leave_game()
+            self.leave_game()  # the puzzle is saved; Continue picks it up again
         elif ch == ord("q"):
-            if g.state == "play" and g.cats() > 0:
-                self.confirm = "quit"
-                self.say("Quit and lose this puzzle?  y / n", "", kind="bad")
-            else:
-                return False
+            return False
         return True
 
     def run(self):
-        while True:
-            self.draw()
-            ch = self.scr.getch()
-            if ch == -1 or ch == curses.KEY_RESIZE:
-                continue
-            if not self.handle(ch):
-                break
+        try:
+            while True:
+                self.draw()
+                ch = self.scr.getch()
+                if ch == -1 or ch == curses.KEY_RESIZE:
+                    continue
+                if not self.handle(ch):
+                    break
+                self.autosave()
+        finally:
+            # quit, Ctrl-C, or the SSH connection dropping (SIGHUP): keep the puzzle
+            self.autosave(force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1934,6 +2095,7 @@ def main(argv=None):
     ap.add_argument("--level", type=int, metavar="N",
                     help="play level N (1-%d) of the -s/-d level pack, skipping the menu" % LEVEL_COUNT)
     ap.add_argument("--play", action="store_true", help="skip the menu and start a random puzzle")
+    ap.add_argument("--resume", action="store_true", help="skip the menu and continue your unfinished puzzle")
     ap.add_argument("--lives", type=int, default=3, help="lives per puzzle, 0 = unlimited (default 3)")
     ap.add_argument("--stealth", action="store_true", help="start in stealth mode (Tab toggles)")
     ap.add_argument("--no-color", action="store_true", help="monochrome; uses borders and letters")
@@ -1991,9 +2153,15 @@ def main(argv=None):
     def _run(scr):
         App(scr, args, file_source).run()
 
+    def hangup(signum, frame):
+        raise KeyboardInterrupt  # unwinds through App.run, which saves the puzzle
+
+    for name in ("SIGHUP", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), hangup)
     try:
         curses.wrapper(_run)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, curses.error):
         pass
     return 0
 
